@@ -290,6 +290,15 @@ _URL_TRANSPORTS = {"http", "streamable_http", "sse", "websocket"}
 # still parallelizing the common 3–7 server case to completion.
 _MAX_CONCURRENT_CONNECTIONS = 8
 
+# Per-server time limit for ``get_tools`` in :func:`_load_tools`.  A server
+# that hasn't answered by then is skipped like one that failed, so a single
+# slow server can't hold up the rest.  This has to stay under the 60s health
+# budget in ``start_langgraph_dev`` (which builds its graphs, and so loads MCP
+# tools, before answering ``/ok``) while still leaving room for a first
+# ``npx -y`` launch that downloads its package.  Shutting down a stdio server
+# that timed out adds up to ~4s on top (the MCP SDK's termination waits).
+_GET_TOOLS_TIMEOUT_SECONDS = 40
+
 # Env vars forwarded to stdio MCP subprocesses on top of the MCP SDK's
 # minimal default set (HOME/PATH/USER/…). Without this, servers behind
 # a proxy or with a custom CA bundle silently fail with long timeouts.
@@ -1016,19 +1025,31 @@ async def _load_tools(
         async with sem:
             _report("start", name)
             try:
-                tools = await client.get_tools(server_name=name)
+                tools = await asyncio.wait_for(
+                    client.get_tools(server_name=name),
+                    timeout=_GET_TOOLS_TIMEOUT_SECONDS,
+                )
                 logger.info("MCP server %r: loaded %d tool(s)", name, len(tools))
                 _report("success", name, str(len(tools)))
                 return name, tools
             except Exception as exc:
+                # ``wait_for`` raises a bare TimeoutError with no message.
+                if isinstance(exc, TimeoutError):
+                    detail = f"timed out after {_GET_TOOLS_TIMEOUT_SECONDS}s"
+                else:
+                    detail = str(exc)
                 # When the caller wired up ``on_progress`` they own the
                 # user-facing display; downgrade the logger so we don't
                 # double-print.
                 if on_progress is None:
-                    logger.warning("MCP server %r: failed to load tools: %s", name, exc)
+                    logger.warning(
+                        "MCP server %r: failed to load tools: %s", name, detail
+                    )
                 else:
-                    logger.debug("MCP server %r: failed to load tools: %s", name, exc)
-                _report("error", name, str(exc))
+                    logger.debug(
+                        "MCP server %r: failed to load tools: %s", name, detail
+                    )
+                _report("error", name, detail)
                 return name, []
 
     # ``return_exceptions=False`` is fine because ``_fetch`` already

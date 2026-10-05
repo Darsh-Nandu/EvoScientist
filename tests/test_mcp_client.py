@@ -1904,6 +1904,50 @@ class TestLoadToolsProgressCallback:
         assert inflight["peak"] <= 3
         assert inflight["peak"] > 1  # sanity: we *are* parallelizing
 
+    async def test_slow_server_is_skipped_after_timeout(self, monkeypatch):
+        """A server that never answers is reported as an error and left out,
+        and the other servers still load."""
+        import asyncio
+
+        from EvoScientist.mcp import client as mcp_client
+
+        class _HangingClient:
+            def __init__(self, connections):
+                self.connections = connections
+
+            async def get_tools(self, server_name):
+                if server_name == "slow_srv":
+                    await asyncio.Event().wait()
+                return ["a"]
+
+        import langchain_mcp_adapters.client as lc_client
+
+        monkeypatch.setattr(lc_client, "MultiServerMCPClient", _HangingClient)
+        monkeypatch.setattr(mcp_client, "_GET_TOOLS_TIMEOUT_SECONDS", 0.05)
+
+        events: list[tuple[str, str, str]] = []
+
+        def record(event, name, detail):
+            events.append((event, name, detail))
+
+        config = {
+            "ok_srv": {"transport": "stdio", "command": "demo"},
+            "slow_srv": {"transport": "stdio", "command": "demo"},
+        }
+        result = await asyncio.wait_for(
+            mcp_client._load_tools(config, on_progress=record), timeout=5
+        )
+
+        assert result == {"ok_srv": ["a"], "slow_srv": []}
+        by_server = {}
+        for ev, name, detail in events:
+            by_server.setdefault(name, []).append((ev, detail))
+        assert by_server["ok_srv"] == [("start", ""), ("success", "1")]
+        assert by_server["slow_srv"] == [
+            ("start", ""),
+            ("error", "timed out after 0.05s"),
+        ]
+
 
 # ---- _ensure_node_for_stdio ----
 
