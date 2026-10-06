@@ -735,10 +735,15 @@ class TestStdioKillOnCancelPatch:
         )
 
         assert result == {"stubborn": []}
+        # The kill can still be finishing when ``_load_tools`` returns, so
+        # wait for the process to go away rather than check it only once.
         pid = int(pidfile.read_text())
-        assert not psutil.pid_exists(pid) or (
-            psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
-        )
+        try:
+            psutil.Process(pid).wait(timeout=5)
+        except psutil.NoSuchProcess:
+            pass  # Already gone.
+        except psutil.TimeoutExpired:
+            pytest.fail(f"stdio server {pid} is still running after the kill")
 
 
 # ---- _filter_tools ----
