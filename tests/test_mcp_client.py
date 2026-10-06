@@ -620,6 +620,127 @@ class TestStdioErrlogSafetyPatch:
         assert getattr(adapter_sessions.stdio_client, "_evosci_errlog_safe", False)
 
 
+# ---- stdio kill-on-cancel patch ----
+
+# Answers tools/list after a delay, then keeps running after its stdin closes,
+# so the SDK's 2s "wait for exit" never ends on its own.
+_STUBBORN_STDIO_SERVER = textwrap.dedent(
+    """
+    import json, os, sys, time
+
+    delay, pidfile = float(sys.argv[1]), sys.argv[2]
+    with open(pidfile, "w") as f:
+        f.write(str(os.getpid()))
+
+    def send(msg):
+        sys.stdout.write(json.dumps(msg) + "\\n")
+        sys.stdout.flush()
+
+    for line in sys.stdin:
+        msg = json.loads(line)
+        method, mid = msg.get("method"), msg.get("id")
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                "protocolVersion": msg["params"]["protocolVersion"],
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "stubborn", "version": "0"}}})
+        elif method == "tools/list":
+            time.sleep(delay)
+            send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [
+                {"name": "ping", "inputSchema": {"type": "object"}}]}})
+        elif mid is not None:
+            send({"jsonrpc": "2.0", "id": mid, "result": {}})
+
+    while True:
+        time.sleep(1)
+    """
+)
+
+
+class TestStdioKillOnCancelPatch:
+    """A deadline that lands while the SDK waits for a stdio server to exit
+    must still kill the server (#580)."""
+
+    @staticmethod
+    def _patch_with(monkeypatch, process):
+        import mcp.client.stdio as stdio_mod
+
+        from EvoScientist.mcp import client as mcp_client
+
+        terminated: list = []
+
+        async def fake_create(*args, **kwargs):
+            return process
+
+        async def fake_terminate(proc, *args, **kwargs):
+            terminated.append(proc)
+
+        monkeypatch.setattr(
+            stdio_mod, "_create_platform_compatible_process", fake_create
+        )
+        monkeypatch.setattr(stdio_mod, "_terminate_process_tree", fake_terminate)
+        mcp_client._patch_mcp_stdio_kill_on_cancel()
+        return stdio_mod, terminated
+
+    async def test_cancelled_wait_kills_the_process_tree(self, monkeypatch):
+        import anyio
+
+        class _NeverExits:
+            async def wait(self):
+                await anyio.sleep_forever()
+
+        process = _NeverExits()
+        stdio_mod, terminated = self._patch_with(monkeypatch, process)
+
+        created = await stdio_mod._create_platform_compatible_process("demo", [])
+        with anyio.move_on_after(0.05):
+            await created.wait()
+
+        assert terminated == [process]
+
+    async def test_wait_that_finishes_does_not_kill(self, monkeypatch):
+        class _Exits:
+            async def wait(self):
+                return 0
+
+        stdio_mod, terminated = self._patch_with(monkeypatch, _Exits())
+
+        created = await stdio_mod._create_platform_compatible_process("demo", [])
+
+        assert await created.wait() == 0
+        assert terminated == []
+
+    async def test_deadline_during_shutdown_does_not_hang(self, tmp_path):
+        """End to end with a real subprocess: the server answers at 0.5s, so
+        the 1s limit lands inside the SDK's 2s wait for it to exit."""
+        import asyncio
+
+        import psutil
+
+        from EvoScientist.mcp import client as mcp_client
+
+        script = tmp_path / "stubborn_server.py"
+        script.write_text(_STUBBORN_STDIO_SERVER)
+        pidfile = tmp_path / "server.pid"
+        config = {
+            "stubborn": {
+                "transport": "stdio",
+                "command": sys.executable,
+                "args": [str(script), "0.5", str(pidfile)],
+            }
+        }
+
+        result = await asyncio.wait_for(
+            mcp_client._load_tools(config, timeout=1.0), timeout=15
+        )
+
+        assert result == {"stubborn": []}
+        pid = int(pidfile.read_text())
+        assert not psutil.pid_exists(pid) or (
+            psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+        )
+
+
 # ---- _filter_tools ----
 
 
