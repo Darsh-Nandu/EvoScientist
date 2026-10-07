@@ -16,9 +16,10 @@ predictable timeline; this subclass gives us the mechanism locally.
 Design
 ------
 - Subclass ``AsyncSubAgentMiddleware``; call ``super().__init__()`` for spec
-  validation + default 5-tool build, then swap in a start tool that injects
-  ``skill_name=subagent_type`` by construction (keeping check / update /
-  cancel / list unchanged).
+  validation + system-prompt composition, then rebuild all five tools on a
+  config-injecting client cache: the start tool injects
+  ``skill_name=subagent_type`` by construction, update forwards the caller's
+  model, and check / cancel / list keep upstream bodies.
 - The tool signature matches upstream exactly: ``(description, subagent_type,
   runtime)``. No LLM-visible ``payload`` field: every value the middleware
   can derive itself (the skill name) is injected inside the middleware, not
@@ -493,24 +494,12 @@ class EvoAsyncSubAgentMiddleware(AsyncSubAgentMiddleware):
         watcher_agents: dict[str, AsyncSubAgent] | None = None,
         cfg: Any | None = None,
     ) -> None:
-        # Install the model-passthrough patch BEFORE ``super().__init__(...)``
-        # so upstream's ``_build_async_subagent_tools`` sees the patched
-        # ``_build_start_tool`` / ``_build_update_tool`` module attributes.
-        # Idempotent (guarded by ``_model_passthrough_patched`` in
-        # ``llm/patches.py``), so re-invocation on repeated middleware
-        # construction is a no-op. Without this, super()'s vanilla tools
-        # would still ignore ``cfg.model`` — including ``update_async_task``,
-        # which we inherit unchanged below.
-        from ..llm.patches import (
-            _ClientCacheProxy,
-            _patch_deepagents_model_passthrough,
-        )
-
-        _patch_deepagents_model_passthrough()
+        from ..llm.patches import _ClientCacheProxy
 
         # Upstream's __init__ validates spec shape, builds the default 5-tool
         # list, and composes the system_prompt. Delegate to it, then swap in
-        # the skill-name-injecting start tool. This wastes one tool-build cycle
+        # all five tools using our config-injecting client cache below.
+        # This wastes one tool-build cycle
         # (~microseconds at construction) but avoids duplicating upstream's
         # validation and system-prompt-composition logic. Pass ``system_prompt``
         # through unchanged — deepagents 0.7.0 dropped its ``ASYNC_TASK_SYSTEM_PROMPT``
