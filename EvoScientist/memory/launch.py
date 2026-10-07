@@ -78,12 +78,24 @@ def _memory_worker_user_prompt(context: MemorySourceContext) -> str:
             raise ValueError(f"Unsupported memory source type: {context.source_type!r}")
 
 
-def _runs_create_kwargs(payload: BackgroundRunPayload) -> BackgroundRunPayload:
+def _runs_create_kwargs(
+    payload: BackgroundRunPayload, *, workspace_dir: str
+) -> BackgroundRunPayload:
+    """Merge the live model and the run's folders into *payload*.
+
+    Memory belongs to the workspace, so a run forwards its root and the
+    server checks that.
+    """
     try:
         from EvoScientist.llm.patches import _merge_runs_config_kwargs
     except Exception:
         return payload
-    return cast("BackgroundRunPayload", _merge_runs_config_kwargs(dict(payload)))
+    return cast(
+        "BackgroundRunPayload",
+        _merge_runs_config_kwargs(
+            dict(payload), folders={"workspace_dir": workspace_dir}
+        ),
+    )
 
 
 def _worker_workspace_dir(workspace_dir: str | Path) -> str:
@@ -122,7 +134,7 @@ def _memory_worker_run_payload(
             }
         },
     }
-    return _runs_create_kwargs(payload)
+    return _runs_create_kwargs(payload, workspace_dir=metadata["workspace_dir"])
 
 
 def memory_worker_launch_request(
@@ -178,10 +190,11 @@ def _observation_linker_run_payload(
     context: ObservationLinkerContext,
     thread_id: str,
 ) -> BackgroundRunPayload:
+    metadata = _observation_linker_metadata(context)
     payload: BackgroundRunPayload = {
         "assistant_id": OBSERVATION_LINKER_GRAPH_ID,
         "input": messages_input(_observation_linker_user_prompt(context)),
-        "metadata": _observation_linker_metadata(context),
+        "metadata": metadata,
         "config": {
             "configurable": {
                 "thread_id": thread_id,
@@ -193,7 +206,7 @@ def _observation_linker_run_payload(
             }
         },
     }
-    return _runs_create_kwargs(payload)
+    return _runs_create_kwargs(payload, workspace_dir=metadata["workspace_dir"])
 
 
 def observation_linker_launch_request(

@@ -623,8 +623,14 @@ class LangGraphServerGateway:
         self,
         thread_id: str,
         configurable_extra: Mapping[str, Any] | None,
+        *,
+        target: GraphTarget | None = None,
     ) -> dict[str, Any]:
         """Assemble this run's config, reading the live session config here.
+
+        The target's folders go in last and replace any a caller put in
+        ``configurable_extra``, so the server checks the run against the
+        folders the session works in and can refuse it when it serves others.
 
         ``_ensure_config`` returns the cached, in-place-mutated session
         config — NOT a fresh disk read — so mid-session ``/model`` edits that
@@ -650,13 +656,27 @@ class LangGraphServerGateway:
             if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0
             else None
         )
-        return resolve_per_run_config(
+        folders = (
+            {"workspace_dir": target.workspace_dir, "run_dir": target.run_dir}
+            if target is not None
+            else {}
+        )
+        extra = {
+            key: value
+            for key, value in (configurable_extra or {}).items()
+            if key not in folders
+        }
+        config = resolve_per_run_config(
             thread_id,
-            configurable_extra,
+            extra,
             per_run_overrides=overrides,
             recursion_limit=recursion_limit,
             hitl_suppressed=hitl_suppressed_for_run(cfg),
         )
+        for key, value in folders.items():
+            if value:
+                config["configurable"][key] = value
+        return config
 
     async def _ensure_thread(self, request: RunRequest) -> None:
         await self.thread_store.ensure_thread_exists(
@@ -676,7 +696,9 @@ class LangGraphServerGateway:
         *,
         thread_ready: bool = False,
     ) -> None:
-        config = self._resolve_run_config(request.thread_id, request.configurable_extra)
+        config = self._resolve_run_config(
+            request.thread_id, request.configurable_extra, target=request.target
+        )
         # ``_stream_events`` already registered the thread before the pre-run
         # state read. Skip the second ``threads.create(if_exists="do_nothing")``
         # when that succeeded; retry only if it raised (the warn-and-continue
