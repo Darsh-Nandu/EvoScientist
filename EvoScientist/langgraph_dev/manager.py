@@ -481,8 +481,8 @@ def _wait_for_port_release(
     """Poll until ``port`` is released or ``timeout`` elapses.
 
     Used after ``stop_langgraph_dev`` / ``_kill_owned_stale_process`` to
-    bridge the kernel's TIME_WAIT delay before we try to bind again. Returns
-    True if the port is free, False on timeout.
+    wait for the old server to exit and close its listener before we try to
+    bind again. Returns True if the port is free, False on timeout.
     """
     deadline = time.monotonic() + timeout
     while _is_port_occupied(port, host) and time.monotonic() < deadline:
@@ -495,10 +495,14 @@ def _can_bind_port(port: int, host: str = _DEFAULT_HOST) -> bool:
 
     More reliable than ``_is_port_occupied`` when the previous listener has
     just exited: ``connect_ex`` can already report "free" while ``bind()``
-    still fails because the kernel hasn't fully released the socket
-    (TIME_WAIT for accepted connections, SO_REUSEADDR rules, etc.). This
+    still fails because the kernel hasn't fully released the socket. This
     actually attempts the bind that langgraph dev would attempt, then
     closes immediately.
+
+    On POSIX it sets ``SO_REUSEADDR`` like uvicorn does, so connections the
+    old server left in TIME_WAIT (60s on Linux) don't make a port look busy
+    that the server could bind. Not on Windows, where the option also allows
+    binding over a live listener.
 
     Binds the *literal* ``host`` — not ``_probe_host(host)`` — because this
     must replicate the server's own bind: a loopback probe can succeed while
@@ -509,6 +513,8 @@ def _can_bind_port(port: int, host: str = _DEFAULT_HOST) -> bool:
     family = _socket.AF_INET6 if ":" in host else _socket.AF_INET
     s = _socket.socket(family, _socket.SOCK_STREAM)
     try:
+        if os.name != "nt":
+            s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
         s.bind((host, port))
         return True
     except OSError:
@@ -530,9 +536,10 @@ def _wait_for_port_bindable(
     so we don't pass the lighter ``_is_port_occupied`` gate only to fail
     on the actual bind a few seconds later.
 
-    Default 60s timeout matches macOS's TCP TIME_WAIT duration — a port
-    held by an exited listener is genuinely unbindable for up to that long
-    on a tight CLI exit + restart cycle. Shorter timeouts give up too early.
+    The 60s default gives a previous server that is still exiting time to
+    release the port. TIME_WAIT connections it leaves behind don't count:
+    ``_can_bind_port`` binds with ``SO_REUSEADDR`` on POSIX, as the server
+    does.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -953,16 +960,17 @@ def start_langgraph_dev(
     # Defensive: handle a port that's occupied but not serving /ok.
     # Three cases:
     #   (a) Our own previous langgraph dev (PID matches RUNTIME.pid_file) — kill it.
-    #   (b) Our own previous langgraph dev exited but the kernel still holds
-    #       the socket in TIME_WAIT — no live PID for lsof to match, and the
-    #       PID file may already be gone (stop_langgraph_dev unlinks it). The
-    #       bind poll below correctly waits this out.
+    #   (b) Our own previous langgraph dev is still exiting and its listener
+    #       is still open, but the PID file may already be gone
+    #       (stop_langgraph_dev unlinks it), so there's nothing to match it
+    #       against. The bind poll below waits this out.
     #   (c) Foreign process legitimately holds the port — we must NOT kill it.
     #       The bind poll will keep failing and raise an actionable error.
     # We don't try to disambiguate (b) vs (c) here: ``_kill_owned_stale_process``
-    # only verifies PID-file ownership, so absence of a match conflates "stale
-    # TIME_WAIT" with "foreign process". Falling through to the bind poll
-    # disambiguates by behavior — TIME_WAIT clears, foreign listeners don't.
+    # only verifies PID-file ownership, so absence of a match conflates "our
+    # server, still exiting" with "foreign process". Falling through to the
+    # bind poll disambiguates by behavior: an exiting server releases the
+    # port, a foreign listener doesn't.
     if not is_langgraph_dev_running(port=port, host=host) and _is_port_occupied(
         port, host
     ):
@@ -972,18 +980,17 @@ def start_langgraph_dev(
                 RUNTIME.pid_file,
                 port,
             )
-            # After SIGKILL the kernel may keep the port in TIME_WAIT for
-            # several seconds before fully releasing it. Poll until the port
-            # is genuinely free so the upcoming bind() doesn't race a
-            # half-released socket and crash with "Port already in use".
+            # After SIGKILL the process can take a moment to exit and close
+            # its listener. Poll until the port is free so the upcoming bind()
+            # doesn't race it and crash with "Port already in use".
             _wait_for_port_release(port, host=host)
         else:
-            # No owned stale PID — could be foreign or kernel-only TIME_WAIT
-            # from a previous subprocess. Defer to the bind poll below.
+            # No owned stale PID — could be foreign or a previous server
+            # that is still exiting. Defer to the bind poll below.
             logger.info(
-                "Port %d occupied with no owned stale PID — waiting for "
-                "kernel TIME_WAIT release (or bind-poll timeout if a "
-                "foreign process holds it).",
+                "Port %d occupied with no owned stale PID — waiting for it "
+                "to be released (or bind-poll timeout if a foreign process "
+                "holds it).",
                 port,
             )
 
@@ -993,11 +1000,11 @@ def start_langgraph_dev(
     # that mismatch is what makes back-to-back CLI exit + restart show
     # "Port already in use" even though our pre-checks passed. By probing
     # the same operation langgraph dev will do, we either wait it out or
-    # fail clearly with an actionable message. 60s covers macOS TIME_WAIT.
+    # fail clearly with an actionable message.
     if not _wait_for_port_bindable(port, host=host):
         raise RuntimeError(
-            f"{host}:{port} cannot be bound after waiting 60s (kernel TIME_WAIT "
-            f"or another process holds it). Free the port with `lsof -ti:{port}`, "
+            f"{host}:{port} cannot be bound after waiting 60s (another process "
+            f"holds it). Free the port with `lsof -ti:{port}`, "
             f"or change ports with: `EvoSci config set langgraph_dev_port <other-port>`"
         )
 
@@ -1456,12 +1463,13 @@ def _ensure_langgraph_dev_locked(
         )
         stop_langgraph_dev()
         # Crucial: stop_langgraph_dev unlinks the PID file. If we then fell
-        # through with the port still in TIME_WAIT, the next defensive
-        # ``_kill_owned_stale_process`` call inside start_langgraph_dev would
-        # see no PID file, treat the lingering socket as a foreign process,
-        # and abort with a hard "non-langgraph process" error — turning a
-        # clean owned restart into a permanent async-disable. Wait inline for
-        # the kernel to release the port before continuing.
+        # through while the old server was still closing its listener, the
+        # next defensive ``_kill_owned_stale_process`` call inside
+        # start_langgraph_dev would see no PID file, treat the lingering
+        # listener as a foreign process, and abort with a hard
+        # "non-langgraph process" error — turning a clean owned restart into
+        # a permanent async-disable. Wait inline for the port to be released
+        # before continuing.
         _wait_for_port_release(port, host=host)
         _ASYNC_SUBAGENTS_AVAILABLE = False  # cleared until restart succeeds
 
