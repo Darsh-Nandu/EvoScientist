@@ -2005,35 +2005,41 @@ class TestLoadToolsProgressCallback:
         assert seen == [mcp_client._SERVER_GET_TOOLS_TIMEOUT_SECONDS]
 
     @pytest.mark.parametrize(
-        ("server_process", "expected"),
-        [("1", "server limit"), (None, None)],
+        ("server_process", "expected_tools"),
+        [("1", []), (None, ["ping"])],
     )
-    def test_sync_loader_applies_the_limit_only_in_langgraph_dev(
-        self, monkeypatch, server_process, expected
+    def test_sync_loader_cuts_off_slow_stdio_only_in_langgraph_dev(
+        self, monkeypatch, server_process, expected_tools
     ):
         """``langgraph dev`` reaches ``_load_tools`` through the sync loader
-        (via ``_load_mcp_tools_cached``), so check that path on its own."""
+        (via ``_load_mcp_tools_cached``). A slow stdio server is cut off there
+        and left to finish everywhere else."""
+        import asyncio
+
         from EvoScientist.mcp import client as mcp_client
 
-        seen: list[float | None] = []
+        class _SlowClient:
+            def __init__(self, connections):
+                self.connections = connections
 
-        async def fake_load_tools(config, *, on_progress=None, timeout=None):
-            seen.append(timeout)
-            return {}
+            async def get_tools(self, server_name):
+                await asyncio.sleep(0.5)
+                return [SimpleNamespace(name="ping")]
 
-        monkeypatch.setattr(mcp_client, "_load_tools", fake_load_tools)
+        import langchain_mcp_adapters.client as lc_client
+
+        monkeypatch.setattr(lc_client, "MultiServerMCPClient", _SlowClient)
+        monkeypatch.setattr(mcp_client, "_SERVER_GET_TOOLS_TIMEOUT_SECONDS", 0.05)
         if server_process is None:
             monkeypatch.delenv("EVOSCIENTIST_SERVER_PROCESS", raising=False)
         else:
             monkeypatch.setenv("EVOSCIENTIST_SERVER_PROCESS", server_process)
 
-        config = {"srv": {"transport": "stdio", "command": "demo"}}
-        mcp_client.load_mcp_tools(config)
+        config = {"slow_srv": {"transport": "stdio", "command": "demo"}}
+        result = mcp_client.load_mcp_tools(config)
 
-        if expected == "server limit":
-            assert seen == [mcp_client._SERVER_GET_TOOLS_TIMEOUT_SECONDS]
-        else:
-            assert seen == [None]
+        tools = [tool.name for agent_tools in result.values() for tool in agent_tools]
+        assert tools == expected_tools
 
     def test_sync_loader_warns_with_the_timeout_reason(self, monkeypatch, caplog):
         """With no ``on_progress`` (the ``langgraph dev`` path), a server that
