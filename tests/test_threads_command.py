@@ -100,7 +100,51 @@ class TestThreadsCommand:
         store = FakeThreadStore(threads=threads)
         ctx.graph_gateway = FakeGraphGateway(thread_store=store)
         await ThreadsCommand().execute(ctx, [])
-        # Channel mode: no Model column. 4 columns: ID, Preview, Msgs, Last Used.
+        # Channel mode: no Model column. 5 columns: ID, Preview, Msgs, Workspace,
+        # Last Used.
         table = ui.mount_renderable.call_args.args[0]
         column_headers = [col.header for col in table.columns]
         assert "Model" not in column_headers
+
+    @staticmethod
+    def _workspace_cells(ui) -> list[str]:
+        table = ui.mount_renderable.call_args.args[0]
+        column = next(col for col in table.columns if col.header == "Workspace")
+        return list(column.cells)
+
+    @staticmethod
+    def _workspace_threads(tmp_path) -> list[dict]:
+        project = (tmp_path / "projA").as_posix()
+        return [
+            {"thread_id": "root", "workspace_dir": project},
+            {
+                "thread_id": "run",
+                "workspace_dir": project,
+                "run_dir": f"{project}/runs/20261001_215846",
+            },
+            {"thread_id": "old"},  # Stored before workspaces were recorded.
+        ]
+
+    async def test_workspace_column_shows_the_work_folder(self, tmp_path):
+        from EvoScientist.commands.implementation.session import ThreadsCommand
+
+        ctx, ui = _ctx()
+        store = FakeThreadStore(threads=self._workspace_threads(tmp_path))
+        ctx.graph_gateway = FakeGraphGateway(thread_store=store)
+        await ThreadsCommand().execute(ctx, [])
+
+        assert self._workspace_cells(ui) == [
+            "projA",
+            "projA/runs/20261001_215846",
+            "",
+        ]
+
+    async def test_channel_mode_shows_only_the_folder_name(self, tmp_path):
+        from EvoScientist.commands.implementation.session import ThreadsCommand
+
+        ctx, ui = _ctx(supports_interactive=False)
+        store = FakeThreadStore(threads=self._workspace_threads(tmp_path))
+        ctx.graph_gateway = FakeGraphGateway(thread_store=store)
+        await ThreadsCommand().execute(ctx, [])
+
+        assert self._workspace_cells(ui) == ["projA", "20261001_215846", ""]

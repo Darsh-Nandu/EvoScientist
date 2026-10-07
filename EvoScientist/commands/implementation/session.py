@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
+from pathlib import PurePath
 from typing import ClassVar
 
 from rich.table import Table
@@ -15,6 +17,21 @@ def _graph_gateway(ctx: CommandContext) -> GraphGateway:
     if ctx.graph_gateway is None:
         raise RuntimeError("Session commands require a graph_gateway")
     return ctx.graph_gateway
+
+
+def _workspace_label(thread: dict, *, name_only: bool = False) -> str:
+    """The folder a thread works in, e.g. ``projA`` or ``projA/runs/<name>``.
+
+    With *name_only* it is just the last folder, for channels. Empty when the
+    thread has no stored workspace.
+    """
+    dirs = SessionDirs.from_stored(thread.get("workspace_dir"), thread.get("run_dir"))
+    if dirs is None:
+        return ""
+    if name_only:
+        return dirs.work_dir.name
+    root = dirs.workspace.root
+    return PurePath(root.name, dirs.work_dir.relative_to(root)).as_posix()
 
 
 class CompactCommand(Command):
@@ -109,9 +126,15 @@ class ThreadsCommand(Command):
         table.add_column("Msgs" if is_channel else "Messages", justify="right")
         if not is_channel:
             table.add_column("Model", style="dim")
+        table.add_column("Workspace", style="dim", overflow="fold")
         table.add_column("Last Used", style="dim")
 
-        for thread in threads:
+        # from_stored resolves paths, so keep it off the event loop.
+        workspaces = await asyncio.to_thread(
+            lambda: [_workspace_label(t, name_only=is_channel) for t in threads]
+        )
+
+        for thread, workspace in zip(threads, workspaces, strict=True):
             thread_id_value = thread["thread_id"]
             marker = " *" if thread_id_value == ctx.thread_id else ""
 
@@ -122,6 +145,7 @@ class ThreadsCommand(Command):
             ]
             if not is_channel:
                 row.append(thread.get("model", "") or "")
+            row.append(workspace)
             row.append(_format_relative_time(thread.get("updated_at")))
 
             table.add_row(*row)
