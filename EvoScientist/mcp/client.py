@@ -272,6 +272,16 @@ def _patch_mcp_stdio_errlog_safe() -> None:
 _patch_mcp_stdio_errlog_safe()
 
 
+def _mcp_major_version() -> int | None:
+    """Return the installed MCP SDK's major version, or None if unknown."""
+    try:
+        from importlib.metadata import version
+
+        return int(version("mcp").split(".")[0])
+    except Exception:
+        return None
+
+
 def _patch_mcp_stdio_kill_on_cancel() -> None:
     """Kill a stdio server whose shutdown wait is cancelled.
 
@@ -282,8 +292,20 @@ def _patch_mcp_stdio_kill_on_cancel() -> None:
     ``get_tools`` deadline) skips the kill, and a server that ignores stdin
     closing is then waited on with nothing left to stop it. Wrapping the
     process's ``wait`` kills the tree in that case before the cancellation
-    carries on. mcp 2.x runs its whole shutdown shielded instead.
+    carries on.
+
+    The SDK's own 2s limit also cancels ``wait``, and its kill fallback
+    calls ``wait`` again, so each process is killed at most once: whichever
+    of the wrapper and the SDK gets there first does the kill, and the
+    other does nothing.
+
+    Skipped on mcp 2.x, which runs its whole shutdown shielded and polls
+    ``returncode`` instead of calling ``wait``.
     """
+    major = _mcp_major_version()
+    if major is not None and major >= 2:
+        return
+
     try:
         import anyio
         import mcp.client.stdio as _stdio_mod
@@ -302,6 +324,16 @@ def _patch_mcp_stdio_kill_on_cancel() -> None:
     if getattr(create, "_evosci_kill_on_cancel", False):
         return  # Already patched.
 
+    def _claim_kill(process: Any) -> bool:
+        """Mark ``process`` as killed; False if it already was."""
+        if getattr(process, "_evosci_killed", False):
+            return False
+        try:
+            process._evosci_killed = True
+        except AttributeError:
+            pass  # Can't track it; kill as the SDK would.
+        return True
+
     @wraps(create)
     async def _create_killable_process(*args: Any, **kwargs: Any):
         process = await create(*args, **kwargs)
@@ -311,14 +343,16 @@ def _patch_mcp_stdio_kill_on_cancel() -> None:
             try:
                 return await wait()
             except anyio.get_cancelled_exc_class():
-                # Bounded by the SDK's own termination timeout.
-                with anyio.CancelScope(shield=True):
-                    try:
-                        await terminate(process)
-                    except Exception:
-                        logger.debug(
-                            "Failed to kill cancelled MCP stdio server", exc_info=True
-                        )
+                if _claim_kill(process):
+                    # Bounded by the SDK's own termination timeout.
+                    with anyio.CancelScope(shield=True):
+                        try:
+                            await terminate(process)
+                        except Exception:
+                            logger.debug(
+                                "Failed to kill cancelled MCP stdio server",
+                                exc_info=True,
+                            )
                 raise
 
         try:
@@ -327,8 +361,14 @@ def _patch_mcp_stdio_kill_on_cancel() -> None:
             logger.debug("MCP stdio process does not allow wrapping wait()")
         return process
 
+    @wraps(terminate)
+    async def _terminate_once(process: Any, *args: Any, **kwargs: Any):
+        if _claim_kill(process):
+            await terminate(process, *args, **kwargs)
+
     _create_killable_process._evosci_kill_on_cancel = True  # type: ignore[attr-defined]
     _stdio_mod._create_platform_compatible_process = _create_killable_process
+    _stdio_mod._terminate_process_tree = _terminate_once
     logger.debug("Applied MCP stdio kill-on-cancel patch")
 
 

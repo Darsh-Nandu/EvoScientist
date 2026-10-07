@@ -662,7 +662,7 @@ class TestStdioKillOnCancelPatch:
     must still kill the server (#580)."""
 
     @staticmethod
-    def _patch_with(monkeypatch, process):
+    def _patch_with(monkeypatch, process, on_terminate=None):
         import mcp.client.stdio as stdio_mod
 
         from EvoScientist.mcp import client as mcp_client
@@ -674,6 +674,8 @@ class TestStdioKillOnCancelPatch:
 
         async def fake_terminate(proc, *args, **kwargs):
             terminated.append(proc)
+            if on_terminate is not None:
+                await on_terminate(proc)
 
         monkeypatch.setattr(
             stdio_mod, "_create_platform_compatible_process", fake_create
@@ -710,6 +712,79 @@ class TestStdioKillOnCancelPatch:
         assert await created.wait() == 0
         assert terminated == []
 
+    async def test_sdk_kill_after_its_own_timeout_is_skipped(self, monkeypatch):
+        """The SDK's 2s limit cancels ``wait`` and then kills the tree itself.
+        The wrapper has already killed it by then, so the SDK's kill must do
+        nothing rather than run a second time."""
+        import anyio
+
+        class _NeverExits:
+            async def wait(self):
+                await anyio.sleep_forever()
+
+        process = _NeverExits()
+        stdio_mod, terminated = self._patch_with(monkeypatch, process)
+
+        created = await stdio_mod._create_platform_compatible_process("demo", [])
+        # Same order as the SDK: a timed out wait, then its own kill.
+        with anyio.move_on_after(0.05):
+            await created.wait()
+        await stdio_mod._terminate_process_tree(created)
+
+        assert terminated == [process]
+
+    async def test_kill_that_waits_again_does_not_kill_again(self, monkeypatch):
+        """The SDK's POSIX kill fallback calls ``wait`` with its own time
+        limit. That cancelled wait must not start another kill, or a server
+        that ignores SIGTERM keeps the two re-entering each other."""
+        import anyio
+
+        class _NeverExits:
+            async def wait(self):
+                await anyio.sleep_forever()
+
+        calls: list = []
+
+        async def wait_like_the_fallback(proc):
+            calls.append(proc)
+            if len(calls) < 3:  # Bound the recursion if it comes back.
+                with anyio.move_on_after(0.05):
+                    await proc.wait()
+
+        process = _NeverExits()
+        stdio_mod, terminated = self._patch_with(
+            monkeypatch, process, on_terminate=wait_like_the_fallback
+        )
+
+        created = await stdio_mod._create_platform_compatible_process("demo", [])
+        with anyio.move_on_after(0.05):
+            await created.wait()
+
+        assert terminated == [process]
+
+    def test_skipped_on_mcp_2(self, monkeypatch):
+        """mcp 2.x shields its shutdown and never calls ``wait`` there."""
+        import mcp.client.stdio as stdio_mod
+
+        from EvoScientist.mcp import client as mcp_client
+
+        async def fake_create(*args, **kwargs):
+            return None
+
+        async def fake_terminate(proc, *args, **kwargs):
+            return None
+
+        monkeypatch.setattr(
+            stdio_mod, "_create_platform_compatible_process", fake_create
+        )
+        monkeypatch.setattr(stdio_mod, "_terminate_process_tree", fake_terminate)
+        monkeypatch.setattr(mcp_client, "_mcp_major_version", lambda: 2)
+
+        mcp_client._patch_mcp_stdio_kill_on_cancel()
+
+        assert stdio_mod._create_platform_compatible_process is fake_create
+        assert stdio_mod._terminate_process_tree is fake_terminate
+
     async def test_deadline_during_shutdown_does_not_hang(self, tmp_path):
         """End to end with a real subprocess: the server answers at 0.5s, so
         the 1s limit lands inside the SDK's 2s wait for it to exit."""
@@ -744,6 +819,41 @@ class TestStdioKillOnCancelPatch:
             pass  # Already gone.
         except psutil.TimeoutExpired:
             pytest.fail(f"stdio server {pid} is still running after the kill")
+
+    async def test_sdk_timeout_kills_once_without_logging(self, tmp_path, caplog):
+        """End to end with no time limit: the SDK's own 2s wait runs out on a
+        server that ignores stdin closing. The server must be killed, and the
+        kill must not log anything."""
+        import asyncio
+        import logging
+
+        import psutil
+
+        from EvoScientist.mcp import client as mcp_client
+
+        script = tmp_path / "stubborn_server.py"
+        script.write_text(_STUBBORN_STDIO_SERVER)
+        pidfile = tmp_path / "server.pid"
+        config = {
+            "stubborn": {
+                "transport": "stdio",
+                "command": sys.executable,
+                "args": [str(script), "0", str(pidfile)],
+            }
+        }
+        caplog.set_level(logging.WARNING)
+
+        result = await asyncio.wait_for(mcp_client._load_tools(config), timeout=15)
+
+        assert [tool.name for tool in result["stubborn"]] == ["ping"]
+        pid = int(pidfile.read_text())
+        try:
+            psutil.Process(pid).wait(timeout=5)
+        except psutil.NoSuchProcess:
+            pass  # Already gone.
+        except psutil.TimeoutExpired:
+            pytest.fail(f"stdio server {pid} is still running after the kill")
+        assert [r.getMessage() for r in caplog.records] == []
 
 
 # ---- _filter_tools ----
