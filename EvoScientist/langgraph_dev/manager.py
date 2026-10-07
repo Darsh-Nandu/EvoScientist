@@ -495,10 +495,14 @@ def _can_bind_port(port: int, host: str = _DEFAULT_HOST) -> bool:
 
     More reliable than ``_is_port_occupied`` when the previous listener has
     just exited: ``connect_ex`` can already report "free" while ``bind()``
-    still fails because the kernel hasn't fully released the socket
-    (TIME_WAIT for accepted connections, SO_REUSEADDR rules, etc.). This
+    still fails because the kernel hasn't fully released the socket. This
     actually attempts the bind that langgraph dev would attempt, then
     closes immediately.
+
+    On POSIX it sets ``SO_REUSEADDR`` like uvicorn does, so connections the
+    old server left in TIME_WAIT (60s on Linux) don't make a port look busy
+    that the server could bind. Not on Windows, where the option also allows
+    binding over a live listener.
 
     Binds the *literal* ``host`` — not ``_probe_host(host)`` — because this
     must replicate the server's own bind: a loopback probe can succeed while
@@ -509,6 +513,8 @@ def _can_bind_port(port: int, host: str = _DEFAULT_HOST) -> bool:
     family = _socket.AF_INET6 if ":" in host else _socket.AF_INET
     s = _socket.socket(family, _socket.SOCK_STREAM)
     try:
+        if os.name != "nt":
+            s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
         s.bind((host, port))
         return True
     except OSError:
@@ -530,9 +536,10 @@ def _wait_for_port_bindable(
     so we don't pass the lighter ``_is_port_occupied`` gate only to fail
     on the actual bind a few seconds later.
 
-    Default 60s timeout matches macOS's TCP TIME_WAIT duration — a port
-    held by an exited listener is genuinely unbindable for up to that long
-    on a tight CLI exit + restart cycle. Shorter timeouts give up too early.
+    The 60s default gives a previous server that is still exiting time to
+    release the port. TIME_WAIT connections it leaves behind don't count:
+    ``_can_bind_port`` binds with ``SO_REUSEADDR`` on POSIX, as the server
+    does.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
