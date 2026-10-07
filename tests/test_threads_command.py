@@ -123,6 +123,7 @@ class TestThreadsCommand:
                 "run_dir": f"{project}/runs/20261001_215846",
             },
             {"thread_id": "old"},  # Stored before workspaces were recorded.
+            {"thread_id": "bad", "workspace_dir": 123},  # Not a folder at all.
         ]
 
     async def test_workspace_column_shows_the_work_folder(self, tmp_path):
@@ -137,6 +138,7 @@ class TestThreadsCommand:
             "projA",
             "projA/runs/20261001_215846",
             "",
+            "",
         ]
 
     async def test_channel_mode_shows_only_the_folder_name(self, tmp_path):
@@ -147,4 +149,4 @@ class TestThreadsCommand:
         ctx.graph_gateway = FakeGraphGateway(thread_store=store)
         await ThreadsCommand().execute(ctx, [])
 
-        assert self._workspace_cells(ui) == ["projA", "20261001_215846", ""]
+        assert self._workspace_cells(ui) == ["projA", "20261001_215846", "", ""]
