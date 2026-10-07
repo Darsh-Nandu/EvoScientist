@@ -22,16 +22,19 @@ def _graph_gateway(ctx: CommandContext) -> GraphGateway:
 def _workspace_label(thread: dict, *, name_only: bool = False) -> str:
     """The folder a thread works in, e.g. ``projA`` or ``projA/runs/<name>``.
 
-    With *name_only* it is just the last folder, for channels. Empty when the
-    thread has no stored workspace.
+    With *name_only* it is just the last folder, for channels. A folder at
+    the filesystem root (e.g. ``/`` in a container) has no name, so it shows
+    as the root itself. Empty when the thread has no stored workspace.
     """
     dirs = SessionDirs.from_stored(thread.get("workspace_dir"), thread.get("run_dir"))
     if dirs is None:
         return ""
     if name_only:
-        return dirs.work_dir.name
+        return dirs.work_dir.name or dirs.work_dir.as_posix()
     root = dirs.workspace.root
-    return PurePath(root.name, dirs.work_dir.relative_to(root)).as_posix()
+    return PurePath(
+        root.name or root.as_posix(), dirs.work_dir.relative_to(root)
+    ).as_posix()
 
 
 class CompactCommand(Command):

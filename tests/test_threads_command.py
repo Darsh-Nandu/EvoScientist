@@ -1,7 +1,9 @@
 """Tests for the /threads command."""
 
+from pathlib import PurePath
 from unittest.mock import MagicMock
 
+import pytest
 from rich.table import Table
 
 from EvoScientist.paths import SessionDirs
@@ -150,3 +152,27 @@ class TestThreadsCommand:
         await ThreadsCommand().execute(ctx, [])
 
         assert self._workspace_cells(ui) == ["projA", "20261001_215846", "", ""]
+
+    @pytest.mark.parametrize("supports_interactive", [True, False])
+    async def test_workspace_at_the_filesystem_root(
+        self, tmp_path, supports_interactive
+    ):
+        """A root folder (``/`` in a container) has no name, so the label
+        falls back to the root itself instead of ``.`` or an empty cell."""
+        from EvoScientist.commands.implementation.session import ThreadsCommand
+        from EvoScientist.paths import Workspace
+
+        root = Workspace(tmp_path.anchor).root.as_posix()
+        run = PurePath(root, "runs", "20261001_215846").as_posix()
+        threads = [
+            {"thread_id": "root", "workspace_dir": root},
+            {"thread_id": "run", "workspace_dir": root, "run_dir": run},
+        ]
+        ctx, ui = _ctx(supports_interactive=supports_interactive)
+        ctx.graph_gateway = FakeGraphGateway(
+            thread_store=FakeThreadStore(threads=threads)
+        )
+        await ThreadsCommand().execute(ctx, [])
+
+        expected_run = run if supports_interactive else "20261001_215846"
+        assert self._workspace_cells(ui) == [root, expected_run]
