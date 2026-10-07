@@ -208,6 +208,14 @@ _reader_enqueued_task_ids: set[tuple[str, str]] = set()
 # the claim covers the run the reader is actually about to poll.
 _reader_in_flight: set[tuple[str, str]] = set()
 
+# (task_id, run_id) pairs whose last status read was ``error``, held back until a
+# later pass confirms it. ``runs.get`` can transiently report ``error`` for a run
+# that then succeeds (server-side state writeback race, see #216), and the first
+# terminal read is final here (the run_key goes into the enqueued set), so an
+# unconfirmed ``error`` would inject a wrong notification and swallow the real
+# one. Other terminal statuses are trusted on the first read.
+_reader_unconfirmed_errors: set[tuple[str, str]] = set()
+
 # Idle-tick throttle state for ``enqueue_completions_from_state_throttled``:
 # the last monotonic time the reader polled per thread_id, and whether that
 # poll still saw an active (not-yet-terminal) task worth re-polling. The active
@@ -249,7 +257,9 @@ async def enqueue_completions_from_state(
     Read the ``async_tasks`` registry through the gateway and, for each task not
     already known terminal, ask the gateway for the live run status. Newly
     terminal tasks are enqueued onto the shared consumer queue, so
-    ``consume_notifications`` handles dedup/batching/injection unchanged. Both
+    ``consume_notifications`` handles dedup/batching/injection unchanged. An
+    ``error`` read is enqueued only once a later pass reads it again, since
+    ``runs.get`` can report it transiently for a run that succeeds. Both
     reads go through the gateway, so it behaves identically on either backend.
     This is the sole async-task completion mechanism on both backends.
 
@@ -304,6 +314,13 @@ async def enqueue_completions_from_state(
             if status not in TERMINAL_STATUSES:
                 still_active += 1
                 continue
+            if status == "error" and run_key not in _reader_unconfirmed_errors:
+                # Possibly the transient error; notify only if the next pass
+                # reads it again. Keep polling armed until then.
+                _reader_unconfirmed_errors.add(run_key)
+                still_active += 1
+                continue
+            _reader_unconfirmed_errors.discard(run_key)
             if status == "interrupted" and await _run_was_rotated(
                 gateway, target, thread_id, task_id, run_id
             ):

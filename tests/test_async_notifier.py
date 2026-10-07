@@ -492,6 +492,7 @@ def _drain_all(an_mod):
 def _reset_notifier_state(an_mod):
     _drain_all(an_mod)
     an_mod._reader_enqueued_task_ids.clear()
+    an_mod._reader_unconfirmed_errors.clear()
     an_mod._idle_reader_last_poll.clear()
     an_mod._idle_reader_active_seen.clear()
     an_mod._reader_enqueued_process_ids.clear()
@@ -723,6 +724,52 @@ async def test_reader_dedupes_completion_across_polls():
     # even issues a live status read.
     assert len(drain_notifications("cli-tid")) == 1
     assert gateway.run_status_calls == [("task-1", "run-1")]
+
+
+async def test_reader_holds_a_single_error_read():
+    """``runs.get`` can report ``error`` transiently for a run that then
+    succeeds (#467), so one ``error`` read doesn't notify yet."""
+    gateway = FakeGraphGateway(
+        state_values=_running_registry(),
+        run_statuses={"run-1": "error"},
+    )
+    target = GraphTarget(local_graph=MagicMock())
+
+    active = await async_notifier.enqueue_completions_from_state(
+        gateway, target, "cli-tid"
+    )
+
+    assert drain_notifications("cli-tid") == []
+    assert active == 1  # Idle polling stays armed to confirm it.
+
+
+async def test_reader_notifies_success_after_a_transient_error():
+    gateway = FakeGraphGateway(
+        state_values=_running_registry(),
+        run_statuses={"run-1": "error"},
+    )
+    target = GraphTarget(local_graph=MagicMock())
+
+    await async_notifier.enqueue_completions_from_state(gateway, target, "cli-tid")
+    gateway.run_statuses["run-1"] = "success"
+    await async_notifier.enqueue_completions_from_state(gateway, target, "cli-tid")
+    await async_notifier.enqueue_completions_from_state(gateway, target, "cli-tid")
+
+    assert [n.status for n in drain_notifications("cli-tid")] == ["success"]
+
+
+async def test_reader_notifies_an_error_read_twice():
+    gateway = FakeGraphGateway(
+        state_values=_running_registry(),
+        run_statuses={"run-1": "error"},
+    )
+    target = GraphTarget(local_graph=MagicMock())
+
+    await async_notifier.enqueue_completions_from_state(gateway, target, "cli-tid")
+    await async_notifier.enqueue_completions_from_state(gateway, target, "cli-tid")
+    await async_notifier.enqueue_completions_from_state(gateway, target, "cli-tid")
+
+    assert [n.status for n in drain_notifications("cli-tid")] == ["error"]
 
 
 async def test_reader_surfaces_revision_completion_after_update():
