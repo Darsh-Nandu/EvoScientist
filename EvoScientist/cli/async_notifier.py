@@ -312,6 +312,9 @@ async def enqueue_completions_from_state(
                 still_active += 1  # server unavailable / transient — retry next poll
                 continue
             if status not in TERMINAL_STATUSES:
+                # A held error followed by a live read was the transient one;
+                # only two error reads in a row confirm it.
+                _reader_unconfirmed_errors.discard(run_key)
                 still_active += 1
                 continue
             if status == "error" and run_key not in _reader_unconfirmed_errors:

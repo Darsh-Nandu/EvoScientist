@@ -758,6 +758,22 @@ async def test_reader_notifies_success_after_a_transient_error():
     assert [n.status for n in drain_notifications("cli-tid")] == ["success"]
 
 
+async def test_reader_needs_two_error_reads_in_a_row():
+    """A live read between two ``error`` reads means the first was the
+    transient one, so the second starts over instead of confirming."""
+    gateway = FakeGraphGateway(
+        state_values=_running_registry(),
+        run_statuses={"run-1": "error"},
+    )
+    target = GraphTarget(local_graph=MagicMock())
+
+    for status in ("error", "running", "error", "success"):
+        gateway.run_statuses["run-1"] = status
+        await async_notifier.enqueue_completions_from_state(gateway, target, "cli-tid")
+
+    assert [n.status for n in drain_notifications("cli-tid")] == ["success"]
+
+
 async def test_reader_notifies_an_error_read_twice():
     gateway = FakeGraphGateway(
         state_values=_running_registry(),
