@@ -176,3 +176,30 @@ class TestThreadsCommand:
 
         expected_run = run if supports_interactive else "20261001_215846"
         assert self._workspace_cells(ui) == [root, expected_run]
+
+    async def test_id_stays_whole_next_to_a_long_workspace(self, tmp_path):
+        from rich.console import Console
+
+        from EvoScientist.commands.implementation.session import ThreadsCommand
+
+        project = (tmp_path / "cifar-resnet-ablations").as_posix()
+        threads = [
+            {
+                "thread_id": "a1b2c3d4-5678",
+                "preview": "Reproduce the baseline on CIFAR-10 with ResNet-18",
+                "message_count": 140,
+                "model": "claude-sonnet-4-6",
+                "workspace_dir": project,
+                "run_dir": f"{project}/runs/20261001_215846",
+            }
+        ]
+        ctx, ui = _ctx(thread_id="a1b2c3d4-5678")
+        ctx.graph_gateway = FakeGraphGateway(
+            thread_store=FakeThreadStore(threads=threads)
+        )
+        await ThreadsCommand().execute(ctx, [])
+
+        console = Console(width=100)
+        with console.capture() as capture:
+            console.print(ui.mount_renderable.call_args.args[0])
+        assert "a1b2c3d4 *" in capture.get()

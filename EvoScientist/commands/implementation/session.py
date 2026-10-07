@@ -122,7 +122,7 @@ class ThreadsCommand(Command):
         is_channel = not ctx.ui.supports_interactive
 
         table = Table(title="Sessions", show_header=True, header_style="bold cyan")
-        table.add_column("ID", style="bold")
+        table.add_column("ID", style="bold", no_wrap=True)
         table.add_column(
             "Preview", style="dim", max_width=40 if is_channel else 50, no_wrap=True
         )
