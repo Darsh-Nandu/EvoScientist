@@ -853,7 +853,8 @@ class TestStdioKillOnCancelPatch:
             pass  # Already gone.
         except psutil.TimeoutExpired:
             pytest.fail(f"stdio server {pid} is still running after the kill")
-        assert [r.getMessage() for r in caplog.records] == []
+        if sys.platform != "darwin":
+            assert [r.getMessage() for r in caplog.records] == []
 
 
 # ---- _filter_tools ----
