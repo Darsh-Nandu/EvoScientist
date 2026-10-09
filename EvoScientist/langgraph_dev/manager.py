@@ -140,9 +140,9 @@ _LOCK = threading.RLock()
 CONFIG_DRIFT_SINCE_LAUNCH = False
 
 # Set by ``ensure_langgraph_dev`` to the warning text when it reuses a server
-# whose agents got another ``python`` than this session resolves (see
-# ``research_env.python_drift_message``). The CLI prints it after startup.
-AGENT_PYTHON_DRIFT: str | None = None
+# whose agents got another ``python`` or shell than this session resolves (see
+# ``agent_shell.shell_drift_message``). The CLI prints it after startup.
+AGENT_SHELL_DRIFT: str | None = None
 
 # Set by ``ensure_langgraph_dev``: the workspace root the server it started or
 # reused is known to serve (this process started it, or its sidecar names that
@@ -275,6 +275,7 @@ def _write_workspace_sidecar(
     pid: int,
     config_fingerprint: str | None = None,
     agent_python: str | object | None = _NOT_RECORDED,
+    agent_bash: str | object | None = _NOT_RECORDED,
     run_dir: Path | None = None,
 ) -> None:
     """Record the workspace + pid of the langgraph dev we just started.
@@ -286,7 +287,9 @@ def _write_workspace_sidecar(
     the server consumed; keepalive reuse compares it to detect drift.
     ``agent_python`` (optional) is the ``python`` the server's agents got,
     None when they have none; reuse compares it to warn about a session whose
-    PATH resolves another one.
+    PATH resolves another one. ``agent_bash`` (optional) is the Git Bash
+    their commands run in, None for cmd.exe or a POSIX shell; compared the
+    same way.
 
     Atomic write via temp-file + ``os.replace``: without this, a concurrent
     reader could observe a partially-written file, fail JSON parse, and
@@ -311,6 +314,10 @@ def _write_workspace_sidecar(
             from EvoScientist.setup.research_env import SIDECAR_KEY
 
             payload[SIDECAR_KEY] = agent_python
+        if agent_bash is not _NOT_RECORDED:
+            from EvoScientist.agent_shell import SIDECAR_KEY as BASH_KEY
+
+            payload[BASH_KEY] = agent_bash
         tmp.write_text(json.dumps(payload), encoding="utf-8")
         os.replace(tmp, RUNTIME.workspace_sidecar)
     except OSError as exc:
@@ -481,8 +488,8 @@ def _wait_for_port_release(
     """Poll until ``port`` is released or ``timeout`` elapses.
 
     Used after ``stop_langgraph_dev`` / ``_kill_owned_stale_process`` to
-    bridge the kernel's TIME_WAIT delay before we try to bind again. Returns
-    True if the port is free, False on timeout.
+    wait for the old server to exit and close its listener before we try to
+    bind again. Returns True if the port is free, False on timeout.
     """
     deadline = time.monotonic() + timeout
     while _is_port_occupied(port, host) and time.monotonic() < deadline:
@@ -495,10 +502,14 @@ def _can_bind_port(port: int, host: str = _DEFAULT_HOST) -> bool:
 
     More reliable than ``_is_port_occupied`` when the previous listener has
     just exited: ``connect_ex`` can already report "free" while ``bind()``
-    still fails because the kernel hasn't fully released the socket
-    (TIME_WAIT for accepted connections, SO_REUSEADDR rules, etc.). This
+    still fails because the kernel hasn't fully released the socket. This
     actually attempts the bind that langgraph dev would attempt, then
     closes immediately.
+
+    On POSIX it sets ``SO_REUSEADDR`` like uvicorn does, so connections the
+    old server left in TIME_WAIT (60s on Linux) don't make a port look busy
+    that the server could bind. Not on Windows, where the option also allows
+    binding over a live listener.
 
     Binds the *literal* ``host`` — not ``_probe_host(host)`` — because this
     must replicate the server's own bind: a loopback probe can succeed while
@@ -509,6 +520,8 @@ def _can_bind_port(port: int, host: str = _DEFAULT_HOST) -> bool:
     family = _socket.AF_INET6 if ":" in host else _socket.AF_INET
     s = _socket.socket(family, _socket.SOCK_STREAM)
     try:
+        if os.name != "nt":
+            s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
         s.bind((host, port))
         return True
     except OSError:
@@ -530,9 +543,10 @@ def _wait_for_port_bindable(
     so we don't pass the lighter ``_is_port_occupied`` gate only to fail
     on the actual bind a few seconds later.
 
-    Default 60s timeout matches macOS's TCP TIME_WAIT duration — a port
-    held by an exited listener is genuinely unbindable for up to that long
-    on a tight CLI exit + restart cycle. Shorter timeouts give up too early.
+    The 60s default gives a previous server that is still exiting time to
+    release the port. TIME_WAIT connections it leaves behind don't count:
+    ``_can_bind_port`` binds with ``SO_REUSEADDR`` on POSIX, as the server
+    does.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -953,16 +967,17 @@ def start_langgraph_dev(
     # Defensive: handle a port that's occupied but not serving /ok.
     # Three cases:
     #   (a) Our own previous langgraph dev (PID matches RUNTIME.pid_file) — kill it.
-    #   (b) Our own previous langgraph dev exited but the kernel still holds
-    #       the socket in TIME_WAIT — no live PID for lsof to match, and the
-    #       PID file may already be gone (stop_langgraph_dev unlinks it). The
-    #       bind poll below correctly waits this out.
+    #   (b) Our own previous langgraph dev is still exiting and its listener
+    #       is still open, but the PID file may already be gone
+    #       (stop_langgraph_dev unlinks it), so there's nothing to match it
+    #       against. The bind poll below waits this out.
     #   (c) Foreign process legitimately holds the port — we must NOT kill it.
     #       The bind poll will keep failing and raise an actionable error.
     # We don't try to disambiguate (b) vs (c) here: ``_kill_owned_stale_process``
-    # only verifies PID-file ownership, so absence of a match conflates "stale
-    # TIME_WAIT" with "foreign process". Falling through to the bind poll
-    # disambiguates by behavior — TIME_WAIT clears, foreign listeners don't.
+    # only verifies PID-file ownership, so absence of a match conflates "our
+    # server, still exiting" with "foreign process". Falling through to the
+    # bind poll disambiguates by behavior: an exiting server releases the
+    # port, a foreign listener doesn't.
     if not is_langgraph_dev_running(port=port, host=host) and _is_port_occupied(
         port, host
     ):
@@ -972,18 +987,17 @@ def start_langgraph_dev(
                 RUNTIME.pid_file,
                 port,
             )
-            # After SIGKILL the kernel may keep the port in TIME_WAIT for
-            # several seconds before fully releasing it. Poll until the port
-            # is genuinely free so the upcoming bind() doesn't race a
-            # half-released socket and crash with "Port already in use".
+            # After SIGKILL the process can take a moment to exit and close
+            # its listener. Poll until the port is free so the upcoming bind()
+            # doesn't race it and crash with "Port already in use".
             _wait_for_port_release(port, host=host)
         else:
-            # No owned stale PID — could be foreign or kernel-only TIME_WAIT
-            # from a previous subprocess. Defer to the bind poll below.
+            # No owned stale PID — could be foreign or a previous server
+            # that is still exiting. Defer to the bind poll below.
             logger.info(
-                "Port %d occupied with no owned stale PID — waiting for "
-                "kernel TIME_WAIT release (or bind-poll timeout if a "
-                "foreign process holds it).",
+                "Port %d occupied with no owned stale PID — waiting for it "
+                "to be released (or bind-poll timeout if a foreign process "
+                "holds it).",
                 port,
             )
 
@@ -993,11 +1007,11 @@ def start_langgraph_dev(
     # that mismatch is what makes back-to-back CLI exit + restart show
     # "Port already in use" even though our pre-checks passed. By probing
     # the same operation langgraph dev will do, we either wait it out or
-    # fail clearly with an actionable message. 60s covers macOS TIME_WAIT.
+    # fail clearly with an actionable message.
     if not _wait_for_port_bindable(port, host=host):
         raise RuntimeError(
-            f"{host}:{port} cannot be bound after waiting 60s (kernel TIME_WAIT "
-            f"or another process holds it). Free the port with `lsof -ti:{port}`, "
+            f"{host}:{port} cannot be bound after waiting 60s (another process "
+            f"holds it). Free the port with `lsof -ti:{port}`, "
             f"or change ports with: `EvoSci config set langgraph_dev_port <other-port>`"
         )
 
@@ -1121,15 +1135,17 @@ def start_langgraph_dev(
         except Exception:
             pass
     RUNTIME.pid_file.write_text(str(proc.pid), encoding="utf-8")
+    from EvoScientist.agent_shell import sidecar_bash
     from EvoScientist.setup.research_env import agent_python
 
     _write_workspace_sidecar(
         workspace_dir=workspace_dir,
         pid=proc.pid,
         config_fingerprint=config_fingerprint,
-        # The server inherits this process's environment, so it resolves the
-        # same python.
+        # The server inherits this process's environment and data dir, so it
+        # resolves the same python and reads the same Git Bash record.
         agent_python=agent_python(),
+        agent_bash=sidecar_bash(),
         run_dir=run_dir,
     )
     global _PROCESS_WORKSPACE, _PROCESS_RUN_DIR
@@ -1376,10 +1392,10 @@ def ensure_langgraph_dev(
     still chat with sync sub-agents; only async sub-agent calls and EvoMemory
     background workers will fail.
     """
-    global _ASYNC_SUBAGENTS_AVAILABLE, CONFIG_DRIFT_SINCE_LAUNCH, AGENT_PYTHON_DRIFT
+    global _ASYNC_SUBAGENTS_AVAILABLE, CONFIG_DRIFT_SINCE_LAUNCH, AGENT_SHELL_DRIFT
     global SERVED_WORKSPACE
     CONFIG_DRIFT_SINCE_LAUNCH = False
-    AGENT_PYTHON_DRIFT = None
+    AGENT_SHELL_DRIFT = None
     SERVED_WORKSPACE = None
 
     if not needs_langgraph_dev(config, backend=backend):
@@ -1423,7 +1439,7 @@ def _ensure_langgraph_dev_locked(
     run_dir: Path | str | None = None,
 ) -> subprocess.Popen | None:
     """Locked critical section of ``ensure_langgraph_dev`` — must hold ``_LOCK``."""
-    global _ASYNC_SUBAGENTS_AVAILABLE, CONFIG_DRIFT_SINCE_LAUNCH, AGENT_PYTHON_DRIFT
+    global _ASYNC_SUBAGENTS_AVAILABLE, CONFIG_DRIFT_SINCE_LAUNCH, AGENT_SHELL_DRIFT
     global SERVED_WORKSPACE
     config_fp = _server_config_fingerprint(config)
     port = int(getattr(config, "langgraph_dev_port", _DEFAULT_PORT))
@@ -1456,12 +1472,13 @@ def _ensure_langgraph_dev_locked(
         )
         stop_langgraph_dev()
         # Crucial: stop_langgraph_dev unlinks the PID file. If we then fell
-        # through with the port still in TIME_WAIT, the next defensive
-        # ``_kill_owned_stale_process`` call inside start_langgraph_dev would
-        # see no PID file, treat the lingering socket as a foreign process,
-        # and abort with a hard "non-langgraph process" error — turning a
-        # clean owned restart into a permanent async-disable. Wait inline for
-        # the kernel to release the port before continuing.
+        # through while the old server was still closing its listener, the
+        # next defensive ``_kill_owned_stale_process`` call inside
+        # start_langgraph_dev would see no PID file, treat the lingering
+        # listener as a foreign process, and abort with a hard
+        # "non-langgraph process" error — turning a clean owned restart into
+        # a permanent async-disable. Wait inline for the port to be released
+        # before continuing.
         _wait_for_port_release(port, host=host)
         _ASYNC_SUBAGENTS_AVAILABLE = False  # cleared until restart succeeds
 
@@ -1503,13 +1520,13 @@ def _ensure_langgraph_dev_locked(
                         "settings or version until it is restarted "
                         "(EvoSci server stop)."
                     )
-                from EvoScientist.setup.research_env import python_drift_message
+                from EvoScientist.agent_shell import shell_drift_message
 
-                AGENT_PYTHON_DRIFT = python_drift_message(sidecar)
-                if AGENT_PYTHON_DRIFT is not None:
+                AGENT_SHELL_DRIFT = shell_drift_message(sidecar)
+                if AGENT_SHELL_DRIFT is not None:
                     # INFO: the CLI prints it after startup and the TUI shows
                     # it in the app; a WARNING here would print it twice.
-                    logger.info(AGENT_PYTHON_DRIFT)
+                    logger.info(AGENT_SHELL_DRIFT)
                 if requested is not None:
                     logger.info(
                         "Reusing externally-managed langgraph dev on %s; sidecar "
